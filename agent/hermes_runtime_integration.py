@@ -25,27 +25,12 @@ from .smart_router import (
 
 
 _SNAPSHOT_NAMES = (
-    "model",
-    "provider",
-    "base_url",
-    "api_mode",
-    "api_key",
-    "client",
-    "_anthropic_client",
-    "_anthropic_api_key",
-    "_anthropic_base_url",
-    "_is_anthropic_oauth",
-    "_config_context_length",
-    "_bedrock_region",
-    "_use_prompt_caching",
-    "_use_native_cache_layout",
-    "_cached_system_prompt",
-    "_fallback_chain",
-    "_fallback_model",
-    "_fallback_index",
-    "_fallback_activated",
-    "_primary_runtime",
-    "_client_kwargs",
+    "model", "provider", "base_url", "api_mode", "api_key", "client",
+    "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url",
+    "_is_anthropic_oauth", "_config_context_length", "_bedrock_region",
+    "_use_prompt_caching", "_use_native_cache_layout", "_cached_system_prompt",
+    "_fallback_chain", "_fallback_model", "_fallback_index", "_fallback_activated",
+    "_primary_runtime", "_client_kwargs",
 )
 
 
@@ -57,9 +42,6 @@ def _runtime_snapshot(agent: Any) -> dict[str, Any]:
         value = getattr(agent, name, missing)
         if value is missing:
             continue
-        # Client objects and SDK adapters must remain the same object. The
-        # mutable routing structures are copied so switch_model cannot mutate
-        # the rollback target through a shared list/dict.
         if name in {"_fallback_chain", "_client_kwargs", "_primary_runtime"}:
             if isinstance(value, dict):
                 snapshot[name] = dict(value)
@@ -78,8 +60,6 @@ def _restore_snapshot(agent: Any, snapshot: dict[str, Any]) -> None:
         try:
             setattr(agent, name, value)
         except Exception:
-            # Never turn cleanup into a second failure. Hermes' own runtime
-            # recovery remains the authority for normal provider failures.
             continue
 
 
@@ -97,18 +77,13 @@ def discover_candidates(
     free_models: dict[str, Iterable[str]] | None = None,
     force_refresh: bool = False,
 ) -> list[ModelCandidate]:
-    """Discover provider catalogs using Hermes' existing catalog machinery.
-
-    ``free_models`` is an explicit entitlement declaration. Missing pricing
-    metadata is never interpreted as permission to use a model for free.
-    """
+    """Discover provider catalogs using Hermes' existing catalog machinery."""
     free_models = free_models or {}
     provider_models: dict[str, Iterable[str]] = {}
     for provider in providers:
         provider_models[provider] = router.discover_models(
             provider, force_refresh=force_refresh
         )
-
     return build_candidates(
         provider_models,
         _candidate_metadata_from_hermes,
@@ -117,14 +92,31 @@ def discover_candidates(
 
 
 def _as_switch_kwargs(candidate: ModelCandidate) -> dict[str, Any]:
-    """Build the target accepted by Hermes' ``AIAgent.switch_model``."""
-    extra = candidate.extra or {}
+    """Build a fully resolved target for Hermes' ``AIAgent.switch_model``."""
+    extra = dict(candidate.extra or {})
+    runtime: dict[str, Any] = {}
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        resolved = resolve_runtime_provider(
+            requested=candidate.provider,
+            target_model=candidate.model,
+            explicit_base_url=extra.get("base_url") or None,
+            explicit_api_key=extra.get("api_key") or None,
+        )
+        if isinstance(resolved, dict):
+            runtime = resolved
+    except Exception:
+        # Activation will fail closed through Hermes' existing switch path; the
+        # router itself must not invent credentials or endpoints.
+        runtime = {}
+
     return {
         "new_model": candidate.model,
-        "new_provider": candidate.provider,
-        "api_key": extra.get("api_key", ""),
-        "base_url": extra.get("base_url", ""),
-        "api_mode": extra.get("api_mode", ""),
+        "new_provider": str(runtime.get("provider") or candidate.provider),
+        "api_key": extra.get("api_key") or runtime.get("api_key") or "",
+        "base_url": extra.get("base_url") or runtime.get("base_url") or "",
+        "api_mode": extra.get("api_mode") or runtime.get("api_mode") or "",
     }
 
 
@@ -133,8 +125,8 @@ def routed_turn(agent: Any, decision: RoutingDecision) -> Iterator[RoutingDecisi
     """Activate one routing decision for exactly one user turn.
 
     The caller must perform the explicit-model override check before entering
-    this context. The selected route is activated through Hermes' existing
-    switch implementation so provider-specific transports remain correct.
+    this context. Selected routes use Hermes' native runtime switch and its
+    normal fallback machinery.
     """
     snapshot = _runtime_snapshot(agent)
     try:
@@ -147,9 +139,6 @@ def routed_turn(agent: Any, decision: RoutingDecision) -> Iterator[RoutingDecisi
 
         agent.switch_model(**_as_switch_kwargs(decision.primary))
 
-        # Preserve the user's normal primary as the first recovery candidate.
-        # Hermes' existing fallback engine performs the actual activation and
-        # retry; we only supply the destination.
         original_provider = str(snapshot.get("provider") or "").strip()
         original_model = str(snapshot.get("model") or "").strip()
         if original_provider and original_model:
@@ -163,8 +152,7 @@ def routed_turn(agent: Any, decision: RoutingDecision) -> Iterator[RoutingDecisi
             current_chain = list(getattr(agent, "_fallback_chain", []) or [])
             duplicate = any(
                 isinstance(item, dict)
-                and str(item.get("provider") or "").strip().lower()
-                == original_provider.lower()
+                and str(item.get("provider") or "").strip().lower() == original_provider.lower()
                 and str(item.get("model") or "").strip() == original_model
                 for item in current_chain
             )
