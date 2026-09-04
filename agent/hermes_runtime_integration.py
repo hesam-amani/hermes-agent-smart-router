@@ -1,57 +1,74 @@
 """Hermes runtime integration helpers.
 
-This module is intentionally small: SmartRouter decides *where* a turn should
-run; Hermes remains responsible for actually constructing clients, credentials,
-transports, retries, and fallback behavior.
+SmartRouter decides *where* a turn should run; Hermes remains responsible for
+clients, credentials, transports, retries, cooldowns, and fallback execution.
 
-The integration uses Hermes' existing ``AIAgent.switch_model`` as the single
-runtime activation mechanism. Because that method normally means a persistent
-/model switch, ``routed_turn`` snapshots the primary runtime and restores it at
-the end of the user turn. The selected model therefore behaves like a
-turn-scoped route, not a hidden permanent /model change.
+The integration uses Hermes' existing ``AIAgent.switch_model`` as the runtime
+activation mechanism, then restores the original runtime when the user turn
+ends. This makes automatic routing turn-scoped rather than a hidden persistent
+``/model`` switch.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from copy import deepcopy
 from typing import Any, Iterable, Iterator
 
 from .hermes_adapter import build_candidates
-from .smart_router import CostPolicy, ModelCandidate, RoutingDecision, RoutingRequest, SmartRouter
+from .smart_router import (
+    CostPolicy,
+    ModelCandidate,
+    RoutingDecision,
+    RoutingRequest,
+    SmartRouter,
+)
+
+
+_SNAPSHOT_NAMES = (
+    "model",
+    "provider",
+    "base_url",
+    "api_mode",
+    "api_key",
+    "client",
+    "_anthropic_client",
+    "_anthropic_api_key",
+    "_anthropic_base_url",
+    "_is_anthropic_oauth",
+    "_config_context_length",
+    "_bedrock_region",
+    "_use_prompt_caching",
+    "_use_native_cache_layout",
+    "_cached_system_prompt",
+    "_fallback_chain",
+    "_fallback_model",
+    "_fallback_index",
+    "_fallback_activated",
+    "_primary_runtime",
+    "_client_kwargs",
+)
 
 
 def _runtime_snapshot(agent: Any) -> dict[str, Any]:
-    """Capture the runtime state needed to undo a transient smart route."""
-    names = (
-        "model",
-        "provider",
-        "base_url",
-        "api_mode",
-        "api_key",
-        "client",
-        "_anthropic_client",
-        "_anthropic_api_key",
-        "_anthropic_base_url",
-        "_is_anthropic_oauth",
-        "_config_context_length",
-        "_bedrock_region",
-        "_use_prompt_caching",
-        "_use_native_cache_layout",
-        "_cached_system_prompt",
-        "_fallback_chain",
-        "_fallback_model",
-        "_fallback_index",
-        "_fallback_activated",
-        "_primary_runtime",
-        "_client_kwargs",
-    )
+    """Capture runtime state without copying live client objects."""
     snapshot: dict[str, Any] = {}
     missing = object()
-    for name in names:
+    for name in _SNAPSHOT_NAMES:
         value = getattr(agent, name, missing)
-        if value is not missing:
-            snapshot[name] = deepcopy(value)
+        if value is missing:
+            continue
+        # Client objects and SDK adapters must remain the same object. The
+        # mutable routing structures are copied so switch_model cannot mutate
+        # the rollback target through a shared list/dict.
+        if name in {"_fallback_chain", "_client_kwargs", "_primary_runtime"}:
+            if isinstance(value, dict):
+                snapshot[name] = dict(value)
+            elif isinstance(value, list):
+                snapshot[name] = [dict(x) if isinstance(x, dict) else x for x in value]
+            else:
+                snapshot[name] = value
+        else:
+            snapshot[name] = value
     return snapshot
 
 
@@ -61,8 +78,8 @@ def _restore_snapshot(agent: Any, snapshot: dict[str, Any]) -> None:
         try:
             setattr(agent, name, value)
         except Exception:
-            # Restoration is best effort; the original runtime helper remains
-            # the authoritative mechanism for ordinary fallback recovery.
+            # Never turn cleanup into a second failure. Hermes' own runtime
+            # recovery remains the authority for normal provider failures.
             continue
 
 
@@ -80,10 +97,10 @@ def discover_candidates(
     free_models: dict[str, Iterable[str]] | None = None,
     force_refresh: bool = False,
 ) -> list[ModelCandidate]:
-    """Discover configured provider catalogs and translate them to router candidates.
+    """Discover provider catalogs using Hermes' existing catalog machinery.
 
-    ``free_models`` is an explicit entitlement declaration. A missing price is
-    never interpreted as free.
+    ``free_models`` is an explicit entitlement declaration. Missing pricing
+    metadata is never interpreted as permission to use a model for free.
     """
     free_models = free_models or {}
     provider_models: dict[str, Iterable[str]] = {}
@@ -100,7 +117,7 @@ def discover_candidates(
 
 
 def _as_switch_kwargs(candidate: ModelCandidate) -> dict[str, Any]:
-    """Build the minimal target accepted by ``AIAgent.switch_model``."""
+    """Build the target accepted by Hermes' ``AIAgent.switch_model``."""
     extra = candidate.extra or {}
     return {
         "new_model": candidate.model,
@@ -113,11 +130,11 @@ def _as_switch_kwargs(candidate: ModelCandidate) -> dict[str, Any]:
 
 @contextmanager
 def routed_turn(agent: Any, decision: RoutingDecision) -> Iterator[RoutingDecision]:
-    """Activate a routing decision for exactly one user turn.
+    """Activate one routing decision for exactly one user turn.
 
-    Explicit model selection should be checked by the caller before entering
-    this context. The context itself is deliberately provider-agnostic and
-    delegates activation to Hermes' existing runtime switch implementation.
+    The caller must perform the explicit-model override check before entering
+    this context. The selected route is activated through Hermes' existing
+    switch implementation so provider-specific transports remain correct.
     """
     snapshot = _runtime_snapshot(agent)
     try:
@@ -130,9 +147,9 @@ def routed_turn(agent: Any, decision: RoutingDecision) -> Iterator[RoutingDecisi
 
         agent.switch_model(**_as_switch_kwargs(decision.primary))
 
-        # Make the original primary an in-turn fallback. Hermes owns the actual
-        # fallback activation/retry path; this merely preserves the invariant
-        # that a smart-routed turn can recover to the user's normal model.
+        # Preserve the user's normal primary as the first recovery candidate.
+        # Hermes' existing fallback engine performs the actual activation and
+        # retry; we only supply the destination.
         original_provider = str(snapshot.get("provider") or "").strip()
         original_model = str(snapshot.get("model") or "").strip()
         if original_provider and original_model:
@@ -144,21 +161,20 @@ def routed_turn(agent: Any, decision: RoutingDecision) -> Iterator[RoutingDecisi
                 "api_mode": snapshot.get("api_mode") or "",
             }
             current_chain = list(getattr(agent, "_fallback_chain", []) or [])
-            if not any(
-                str(item.get("provider") or "").strip().lower() == original_provider.lower()
+            duplicate = any(
+                isinstance(item, dict)
+                and str(item.get("provider") or "").strip().lower()
+                == original_provider.lower()
                 and str(item.get("model") or "").strip() == original_model
                 for item in current_chain
-                if isinstance(item, dict)
-            ):
+            )
+            if not duplicate:
                 agent._fallback_chain = [original_fallback, *current_chain]
                 agent._fallback_model = original_fallback
                 agent._fallback_index = 0
 
         yield decision
     finally:
-        # Never leave automatic routing looking like a user-issued persistent
-        # /model switch. Restoring the snapshot also restores the original
-        # fallback chain and primary runtime bookkeeping.
         _restore_snapshot(agent, snapshot)
 
 
@@ -187,8 +203,4 @@ def route_turn(
     return router.route(request, candidates)
 
 
-__all__ = [
-    "discover_candidates",
-    "route_turn",
-    "routed_turn",
-]
+__all__ = ["discover_candidates", "route_turn", "routed_turn"]
